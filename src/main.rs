@@ -708,7 +708,7 @@ impl App {
     ];
     if self.loading {
       spans.push(Span::styled(
-        "  ⏳ loading…",
+        "  ⧖ loading…",
         Style::new().fg(Color::Yellow),
       ));
     }
@@ -739,17 +739,17 @@ impl App {
       };
       f.render_widget(
         pane(
-          format!(" old: {} ", self.view.old_label),
-          Color::Red,
-          &self.view.old_msg,
+          format!(" new: {} ", self.view.new_label),
+          Color::Green,
+          &self.view.new_msg,
         ),
         top,
       );
       f.render_widget(
         pane(
-          format!(" new: {} (m to close) ", self.view.new_label),
-          Color::Green,
-          &self.view.new_msg,
+          format!(" old: {} (m to close) ", self.view.old_label),
+          Color::Red,
+          &self.view.old_msg,
         ),
         bottom,
       );
