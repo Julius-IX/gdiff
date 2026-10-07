@@ -2,7 +2,9 @@ use std::{
   collections::HashMap,
   io::{self, Write},
   process::{Command, Stdio},
+  sync::mpsc::{self, Receiver, Sender},
   thread,
+  time::Duration,
 };
 
 use clap::Parser;
@@ -447,14 +449,45 @@ impl Ctx {
   }
 }
 
+struct Job {
+  offset: usize,
+  width: u16,
+}
+
+struct Reply {
+  offset: usize,
+  width: u16,
+  view: View,
+}
+
+/// Single worker thread: if several requests pile up, only the newest one is built.
+fn worker(ctx: Ctx, jobs: Receiver<Job>, replies: Sender<Reply>) {
+  while let Ok(mut job) = jobs.recv() {
+    while let Ok(newer) = jobs.try_recv() {
+      job = newer;
+    }
+    let view = ctx.build(job.offset, job.width);
+    let r = Reply { offset: job.offset, width: job.width, view };
+    if replies.send(r).is_err() {
+      return;
+    }
+  }
+}
+
 struct App {
   ctx: Ctx,
   total: usize,
   offset: usize,
   max_offset: usize,
+  width: u16,
 
   view: View, // what's on screen right now
+  loading: bool,
   cache: HashMap<usize, View>,
+  jobs: Sender<Job>,
+  replies: Receiver<Reply>,
+  pending_scroll: Option<usize>, // restore scroll after a resize re-render
+
   scroll: usize,
   page: usize,
   exit: bool,
@@ -462,16 +495,22 @@ struct App {
 }
 
 impl App {
-  fn refresh(&mut self) {
+  fn request(&mut self, offset: usize) {
+    let _ = self.jobs.send(Job { offset, width: self.width });
+  }
+
+  /// Point the screen at `self.offset`: instant if cached, otherwise ask the worker.
+  fn goto(&mut self) {
+    self.pending_scroll = None;
     if let Some(v) = self.cache.get(&self.offset) {
       self.view = v.clone();
+      self.scroll = 0;
+      self.loading = false;
     } else {
-      let v = self.ctx.build(self.offset, term_width());
-      self.cache.insert(self.offset, v.clone());
-      self.evict();
-      self.view = v;
+      self.loading = true;
+      let o = self.offset;
+      self.request(o);
     }
-    self.scroll = 0;
   }
 
   fn evict(&mut self) {
@@ -489,7 +528,59 @@ impl App {
     let new = (self.offset as isize + delta).clamp(0, self.max_offset as isize) as usize;
     if new != self.offset {
       self.offset = new;
-      self.refresh();
+      self.goto();
+    }
+  }
+
+  /// Collect whatever the worker has finished.
+  fn pump(&mut self) {
+    while let Ok(r) = self.replies.try_recv() {
+      if r.width != self.width {
+        continue; // rendered for an old terminal size
+      }
+      if r.offset == self.offset {
+        self.view = r.view.clone();
+        self.scroll = self.pending_scroll.take().unwrap_or(0);
+        self.loading = false;
+      }
+      self.cache.insert(r.offset, r.view);
+      self.evict();
+    }
+  }
+
+  fn on_resize(&mut self, cols: u16) {
+    // only pager output depends on width
+    if self.ctx.pager.is_none() {
+      return;
+    }
+    self.width = cols.saturating_sub(2);
+    self.cache.clear();
+    let scroll = self.scroll;
+    self.loading = true;
+    let o = self.offset;
+    self.request(o);
+    self.pending_scroll = Some(scroll);
+  }
+
+  fn on_event(&mut self, ev: Event) {
+    match ev {
+      Event::Resize(c, _) => self.on_resize(c),
+      Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+        KeyCode::Char('q') => self.exit = true,
+        // Esc closes the popup first, quits only when nothing is open
+        KeyCode::Esc if self.show_msg => self.show_msg = false,
+        KeyCode::Esc => self.exit = true,
+        KeyCode::Char('m') => self.show_msg = !self.show_msg,
+        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.exit = true,
+        KeyCode::Right => self.step(1),
+        KeyCode::Left => self.step(-1),
+        KeyCode::Down => self.scroll += 1,
+        KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+        KeyCode::PageDown => self.scroll += self.page,
+        KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page),
+        _ => {}
+      },
+      _ => {}
     }
   }
 
@@ -516,7 +607,7 @@ impl App {
 
     // Indicator line
     let bold = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
-    let indicator = Line::from(vec![
+    let mut spans = vec![
       Span::raw(" new: "),
       Span::styled(self.view.new_label.clone(), bold(Color::Green)),
       Span::raw("   old: "),
@@ -528,8 +619,14 @@ impl App {
         self.total,
         self.ctx.mode_label()
       )),
-    ]);
-    f.render_widget(Paragraph::new(indicator), info);
+    ];
+    if self.loading {
+      spans.push(Span::styled(
+        "  ⏳ loading…",
+        Style::new().fg(Color::Yellow),
+      ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), info);
 
     // Controls bar
     let bar = Paragraph::new(
@@ -574,34 +671,20 @@ impl App {
   }
 
   fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-    self.refresh();
+    self.goto();
     while !self.exit {
       terminal.draw(|f| self.draw(f))?;
-      match event::read()? {
-        // pager output is width-dependent (delta etc.), so re-render on resize
-        Event::Resize(..) if self.ctx.pager.is_some() => {
-          let s = self.scroll;
-          self.cache.clear(); // pager output depends on terminal width
-          self.refresh();
-          self.scroll = s;
+
+      // Wake up every 30ms even with no input so finished background work shows up.
+      if event::poll(Duration::from_millis(30))? {
+        self.on_event(event::read()?);
+        // drain anything else already queued (held arrow key) before redrawing;
+        // stepping is O(1) when cached and the worker drops stale requests
+        while !self.exit && event::poll(Duration::ZERO)? {
+          self.on_event(event::read()?);
         }
-        Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-          KeyCode::Char('q') => self.exit = true,
-          // Esc closes the popup first, quits only when nothing is open
-          KeyCode::Esc if self.show_msg => self.show_msg = false,
-          KeyCode::Esc => self.exit = true,
-          KeyCode::Char('m') => self.show_msg = !self.show_msg,
-          KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.exit = true,
-          KeyCode::Right => self.step(1),
-          KeyCode::Left => self.step(-1),
-          KeyCode::Down => self.scroll += 1,
-          KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
-          KeyCode::PageDown => self.scroll += self.page,
-          KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page),
-          _ => {}
-        },
-        _ => {}
       }
+      self.pump();
     }
     Ok(())
   }
@@ -674,13 +757,25 @@ fn main() {
     color: git(&["config", "--get-colorbool", "color.diff", "true"]).is_ok(),
   };
 
+  let (job_tx, job_rx) = mpsc::channel::<Job>();
+  let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
+  {
+    let ctx = ctx.clone();
+    thread::spawn(move || worker(ctx, job_rx, reply_tx));
+  }
+
   let mut app = App {
     ctx,
     total,
     offset: 0,
     max_offset,
+    width: term_width(),
     view: View::default(),
+    loading: false,
     cache: HashMap::new(),
+    jobs: job_tx,
+    replies: reply_rx,
+    pending_scroll: None,
     scroll: 0,
     page: 10,
     exit: false,
