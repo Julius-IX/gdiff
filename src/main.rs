@@ -9,10 +9,10 @@ use ratatui::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal,
   },
-  layout::{Constraint, Layout},
+  layout::{Constraint, Layout, Rect},
   style::{Color, Modifier, Style},
   text::{Line, Span},
-  widgets::{Block, Borders, Paragraph},
+  widgets::{Block, Borders, Clear, Paragraph, Wrap},
   DefaultTerminal, Frame,
 };
 
@@ -275,6 +275,10 @@ struct App {
   scroll: usize,
   page: usize,
   exit: bool,
+
+  show_msg: bool, // commit message popup
+  old_msg: Vec<Line<'static>>,
+  new_msg: Vec<Line<'static>>,
 }
 
 impl App {
@@ -299,6 +303,44 @@ impl App {
       .map(|s| s.trim().to_string())
       .unwrap_or_else(|_| "???".into());
     format!("{short} ({})", self.name(n))
+  }
+
+  /// Header (hash, author, date) + full message of `base~n
+  fn commit_info(&self, n: usize) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(Color::DarkGray);
+    let fmt = "--format=%h%x00%an%x00%ad%x00%B";
+    let date = "--date=format:%Y-%m-%d %H:%M";
+    let out = match git(&["log", "-1", fmt, date, &self.rev(n)]) {
+      Ok(o) => o,
+      Err(e) => return err_lines(&e),
+    };
+    let mut parts = out.splitn(4, '\0');
+    let (hash, author, when, body) = (
+      parts.next().unwrap_or("").trim(),
+      parts.next().unwrap_or("").trim(),
+      parts.next().unwrap_or("").trim(),
+      parts.next().unwrap_or("").trim(),
+    );
+
+    let mut lines = vec![
+      Line::from(vec![
+        Span::styled(
+          hash.to_string(),
+          Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {author} · {when}"), dim),
+      ]),
+      Line::raw(""),
+    ];
+    for (i, l) in body.lines().enumerate() {
+      let style = if i == 0 {
+        Style::new().add_modifier(Modifier::BOLD) // subject line
+      } else {
+        Style::new()
+      };
+      lines.push(Line::styled(l.replace('\t', "    "), style));
+    }
+    lines
   }
 
   fn mode_label(&self) -> String {
@@ -342,6 +384,14 @@ impl App {
 
     self.old_label = self.side(old_n);
     self.new_label = new_n.map_or("working tree".into(), |n| self.side(n));
+    self.old_msg = self.commit_info(old_n);
+    self.new_msg = match new_n {
+      Some(n) => self.commit_info(n),
+      None => vec![Line::styled(
+        "Working tree: uncommitted changes",
+        Style::new().fg(Color::DarkGray),
+      )],
+    };
     self.title = format!(
       " git diff {}{} ",
       self.name(old_n),
@@ -410,7 +460,6 @@ impl App {
       Span::styled(self.new_label.clone(), bold(Color::Green)),
       Span::raw("   old: "),
       Span::styled(self.old_label.clone(), bold(Color::Red)),
-      Span::styled(self.old_label.clone(), bold(Color::Red)),
       Span::raw(format!(
         "   │ step {}/{} · {} commits · via {}",
         self.offset,
@@ -423,10 +472,44 @@ impl App {
 
     // Controls bar
     let bar = Paragraph::new(
-      " q quit │ ↑/↓ scroll diff │ PgUp/PgDn page │ ←/→ older/newer commit to compare against ",
+      " q quit │ ↑/↓ scroll │ PgUp/PgDn page │ ←/→ older/newer commit │ m messages ",
     )
     .style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(bar, keys);
+
+    // Commit message popup (drawn last so it sits on top)
+    if self.show_msg {
+      let area = centered(f.area(), 70, 60);
+      f.render_widget(Clear, area);
+      let [top, bottom] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+
+      let pane = |title: String, color: Color, lines: &Vec<Line<'static>>| {
+        Paragraph::new(lines.clone())
+          .block(
+            Block::bordered()
+              .border_style(Style::new().fg(color))
+              .title(title),
+          )
+          .wrap(Wrap { trim: false })
+      };
+      f.render_widget(
+        pane(
+          format!(" old: {} ", self.old_label),
+          Color::Red,
+          &self.old_msg,
+        ),
+        top,
+      );
+      f.render_widget(
+        pane(
+          format!(" new: {} (m to close) ", self.new_label),
+          Color::Green,
+          &self.new_msg,
+        ),
+        bottom,
+      );
+    }
   }
 
   fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
@@ -441,7 +524,11 @@ impl App {
           self.scroll = s;
         }
         Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
-          KeyCode::Char('q') | KeyCode::Esc => self.exit = true,
+          KeyCode::Char('q') => self.exit = true,
+          // Esc closes the popup first, quits only when nothing is open
+          KeyCode::Esc if self.show_msg => self.show_msg = false,
+          KeyCode::Esc => self.exit = true,
+          KeyCode::Char('m') => self.show_msg = !self.show_msg,
           KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.exit = true,
           KeyCode::Right => self.step(1),
           KeyCode::Left => self.step(-1),
@@ -456,6 +543,23 @@ impl App {
     }
     Ok(())
   }
+}
+
+/// A rect centered in `area`, `pct_x` wide and `pct_y` tall (in percent).
+fn centered(area: Rect, pct_x: u16, pct_y: u16) -> Rect {
+  let [_, v, _] = Layout::vertical([
+    Constraint::Percentage((100 - pct_y) / 2),
+    Constraint::Percentage(pct_y),
+    Constraint::Percentage((100 - pct_y) / 2),
+  ])
+  .areas(area);
+  let [_, h, _] = Layout::horizontal([
+    Constraint::Percentage((100 - pct_x) / 2),
+    Constraint::Percentage(pct_x),
+    Constraint::Percentage((100 - pct_x) / 2),
+  ])
+  .areas(v);
+  h
 }
 
 fn die(msg: &str) -> ! {
@@ -516,6 +620,9 @@ fn main() {
     scroll: 0,
     page: 10,
     exit: false,
+    show_msg: false,
+    old_msg: vec![],
+    new_msg: vec![],
   };
 
   let mut terminal = ratatui::init();
