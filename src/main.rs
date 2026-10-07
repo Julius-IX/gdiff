@@ -298,21 +298,14 @@ impl App {
     }
   }
 
-  fn side(&self, n: usize) -> String {
-    let short = git(&["rev-parse", "--short", &self.rev(n)])
-      .map(|s| s.trim().to_string())
-      .unwrap_or_else(|_| "???".into());
-    format!("{short} ({})", self.name(n))
-  }
-
-  /// Header (hash, author, date) + full message of `base~n
-  fn commit_info(&self, n: usize) -> Vec<Line<'static>> {
+  /// Short hash + header (hash, author, date) + full message of `base~n` 
+  fn commit_info(&self, n: usize) -> (String, Vec<Line<'static>>) {
     let dim = Style::new().fg(Color::DarkGray);
     let fmt = "--format=%h%x00%an%x00%ad%x00%B";
     let date = "--date=format:%Y-%m-%d %H:%M";
     let out = match git(&["log", "-1", fmt, date, &self.rev(n)]) {
       Ok(o) => o,
-      Err(e) => return err_lines(&e),
+      Err(e) => return ("???".into(), err_lines(&e)),
     };
     let mut parts = out.splitn(4, '\0');
     let (hash, author, when, body) = (
@@ -340,7 +333,7 @@ impl App {
       };
       lines.push(Line::styled(l.replace('\t', "    "), style));
     }
-    lines
+    (hash.to_string(), lines)
   }
 
   fn mode_label(&self) -> String {
@@ -382,16 +375,23 @@ impl App {
     }
     args.push("--".into());
 
-    self.old_label = self.side(old_n);
-    self.new_label = new_n.map_or("working tree".into(), |n| self.side(n));
-    self.old_msg = self.commit_info(old_n);
-    self.new_msg = match new_n {
-      Some(n) => self.commit_info(n),
-      None => vec![Line::styled(
-        "Working tree: uncommitted changes",
-        Style::new().fg(Color::DarkGray),
-      )],
-    };
+    let (old_hash, old_msg) = self.commit_info(old_n);
+    self.old_label = format!("{old_hash} ({})", self.name(old_n));
+    self.old_msg = old_msg;
+    match new_n {
+      Some(n) => {
+        let (hash, msg) = self.commit_info(n);
+        self.new_label = format!("{hash} ({})", self.name(n));
+        self.new_msg = msg;
+      }
+      None => {
+        self.new_label = "working tree".into();
+        self.new_msg = vec![Line::styled(
+          "Working tree: uncommitted changes",
+          Style::new().fg(Color::DarkGray),
+        )];
+      }
+    }
     self.title = format!(
       " git diff {}{} ",
       self.name(old_n),
@@ -494,11 +494,7 @@ impl App {
           .wrap(Wrap { trim: false })
       };
       f.render_widget(
-        pane(
-          format!(" old: {} ", self.old_label),
-          Color::Red,
-          &self.old_msg,
-        ),
+        pane(format!(" old: {} ", self.old_label), Color::Red, &self.old_msg),
         top,
       );
       f.render_widget(
