@@ -273,6 +273,7 @@ fn term_width() -> u16 {
 struct Ctx {
   base: String,      // full hash of the starting commit
   base_name: String, // what to call it in the UI
+  newer: Vec<String>, // commits above `base` on HEAD's first-parent chain; newer[k-1] is k steps up
   working_tree: bool,
   follow: bool,
   raw: bool,
@@ -292,24 +293,25 @@ struct View {
 }
 
 impl Ctx {
-  fn rev(&self, n: usize) -> String {
-    if n == 0 {
-      self.base.clone()
-    } else {
-      format!("{}~{}", self.base, n)
+  /// `n > 0` walks back from the base (`base~n`), `n < 0` walks forward towards HEAD.
+  fn rev(&self, n: isize) -> String {
+    match n {
+      0 => self.base.clone(),
+      n if n > 0 => format!("{}~{}", self.base, n),
+      n => self.newer[(-n) as usize - 1].clone(),
     }
   }
 
-  fn name(&self, n: usize) -> String {
-    if n == 0 {
-      self.base_name.clone()
-    } else {
-      format!("{}~{}", self.base_name, n)
+  fn name(&self, n: isize) -> String {
+    match n {
+      0 => self.base_name.clone(),
+      n if n > 0 => format!("{}~{}", self.base_name, n),
+      n => format!("{}+{}", self.base_name, -n),
     }
   }
 
   /// Short hash + header (hash, author, date) + full message of `base~n`
-  fn commit_info(&self, n: usize) -> (String, Vec<Line<'static>>) {
+  fn commit_info(&self, n: isize) -> (String, Vec<Line<'static>>) {
     let dim = Style::new().fg(Color::DarkGray);
     let fmt = "--format=%h%x00%an%x00%ad%x00%B";
     let date = "--date=format:%Y-%m-%d %H:%M";
@@ -364,12 +366,15 @@ impl Ctx {
 
   /// Build the whole view for `offset`. Pure function of (ctx, offset, width),
   /// so it can run on any thread. git diff + both git logs run in parallel.
-  fn build(&self, offset: usize, width: u16) -> View {
+  fn build(&self, offset: isize, width: u16) -> View {
     // old = the side that moves back in time, new = the static side
     let (old_n, new_n) = if self.follow {
       (offset + 1, Some(offset))
     } else if self.working_tree {
       (offset, None)
+    } else if offset < 0 {
+      // stepping towards newer commits: base is the old side, the newer commit the new side
+      (0, Some(offset))
     } else {
       (offset, Some(0))
     };
@@ -450,13 +455,13 @@ impl Ctx {
 }
 
 struct Job {
-  offset: usize,
+  offset: isize,
   width: u16,
   urgent: bool, // the user is looking at this one (vs. speculative prefetch)
 }
 
 struct Reply {
-  offset: usize,
+  offset: isize,
   width: u16,
   view: Option<View>, // None = job was skipped/dropped
 }
@@ -466,7 +471,7 @@ struct Reply {
 ///  - prefetch jobs run only when nothing urgent is waiting, and only near the cursor
 fn worker(ctx: Ctx, jobs: Receiver<Job>, replies: Sender<Reply>) {
   let mut queue: Vec<Job> = Vec::new();
-  let mut focus = 0usize;
+  let mut focus = 0isize;
 
   loop {
     if queue.is_empty() {
@@ -527,14 +532,15 @@ fn worker(ctx: Ctx, jobs: Receiver<Job>, replies: Sender<Reply>) {
 struct App {
   ctx: Ctx,
   total: usize,
-  offset: usize,
-  max_offset: usize,
+  offset: isize,
+  min_offset: isize,
+  max_offset: isize,
   width: u16,
 
   view: View, // what's on screen right now
   loading: bool,
-  cache: HashMap<usize, View>,
-  requested: HashSet<usize>, // jobs in flight to prevent duplicates
+  cache: HashMap<isize, View>,
+  requested: HashSet<isize>, // jobs in flight to prevent duplicates
   jobs: Sender<Job>,
   replies: Receiver<Reply>,
   pending_scroll: Option<usize>, // restore scroll after a resize re-render
@@ -546,7 +552,7 @@ struct App {
 }
 
 impl App {
-  fn request(&mut self, offset: usize, urgent: bool) {
+  fn request(&mut self, offset: isize, urgent: bool) {
     if self.cache.contains_key(&offset) || self.requested.contains(&offset) {
       return;
     }
@@ -560,9 +566,9 @@ impl App {
 
   fn prefetch(&mut self) {
     for d in [1isize, -1, 2, -2] {
-      let o = self.offset as isize + d;
-      if o >= 0 && o <= self.max_offset as isize {
-        self.request(o as usize, false);
+      let o = self.offset + d;
+      if o >= self.min_offset && o <= self.max_offset {
+        self.request(o, false);
       }
     }
   }
@@ -594,7 +600,7 @@ impl App {
   }
 
   fn step(&mut self, delta: isize) {
-    let new = (self.offset as isize + delta).clamp(0, self.max_offset as isize) as usize;
+    let new = (self.offset + delta).clamp(self.min_offset, self.max_offset);
     if new != self.offset {
       self.offset = new;
       self.goto();
@@ -699,8 +705,9 @@ impl App {
       Span::raw("   old: "),
       Span::styled(self.view.old_label.clone(), bold(Color::Red)),
       Span::raw(format!(
-        "   │ step {}/{} · {} commits · via {}",
+        "   │ step {} [{}..{}] · {} commits · via {}",
         self.offset,
+        self.min_offset,
         self.max_offset,
         self.total,
         self.ctx.mode_label()
@@ -716,7 +723,7 @@ impl App {
 
     // Controls bar
     let bar = Paragraph::new(
-      " q quit │ ↑/↓ scroll │ PgUp/PgDn page │ ←/→ older/newer commit │ m messages ",
+      " q quit │ ↑/↓ scroll │ PgUp/PgDn page │ ←/→ newer/older commit │ m messages ",
     )
     .style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(bar, keys);
@@ -806,7 +813,7 @@ fn main() {
     _ => die("not inside a git repository"),
   }
 
-  let base_name = args.commit.clone().unwrap_or_else(|| "HEAD".into());
+  let mut base_name = args.commit.clone().unwrap_or_else(|| "HEAD".into());
   let base = git(&[
     "rev-parse",
     "--verify",
@@ -820,21 +827,44 @@ fn main() {
     ))
   });
 
+  // a hash typed in full (or abbreviated) is just noise in the labels: use the short form
+  if base_name.len() >= 7
+    && base_name.chars().all(|c| c.is_ascii_hexdigit())
+    && base.starts_with(&base_name.to_lowercase())
+  {
+    base_name = base[..7].to_string();
+  }
+
   let total: usize = git(&["rev-list", "--count", &base])
     .ok()
     .and_then(|s| s.trim().parse().ok())
     .unwrap_or(1);
+
+  // Commits newer than `base` along HEAD's first-parent chain (the same chain `~` walks),
+  // so the user can step forward past the starting commit. Empty if `base` isn't on it
+  // (or when no commit was given, where base is HEAD itself).
+  let newer: Vec<String> = git(&["rev-list", "--first-parent", "HEAD"])
+    .ok()
+    .and_then(|s| {
+      let chain: Vec<&str> = s.lines().collect();
+      let pos = chain.iter().position(|h| *h == base)?;
+      // chain[0] = HEAD ... chain[pos] = base; newer[k-1] = chain[pos-k]
+      Some(chain[..pos].iter().rev().map(|h| h.to_string()).collect())
+    })
+    .unwrap_or_default();
+  let min_offset = -(newer.len() as isize);
 
   // Non-follow: base~X needs X <= total-1. Follow: also needs base~(X+1), so one less.
   let max_offset = if args.follow {
     total.saturating_sub(2)
   } else {
     total.saturating_sub(1)
-  };
+  } as isize;
 
   let ctx = Ctx {
     base,
     base_name,
+    newer,
     working_tree: args.commit.is_none() && !args.follow,
     follow: args.follow,
     raw: args.no_pager,
@@ -854,6 +884,7 @@ fn main() {
     ctx,
     total,
     offset: 0,
+    min_offset,
     max_offset,
     width: term_width(),
     view: View::default(),

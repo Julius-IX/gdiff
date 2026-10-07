@@ -22,6 +22,9 @@ gdiff --no-pager      # ignore your git pager/color config
 
 `X` starts at 0 and goes up to the number of commits reachable from the starting commit.
 
+With an explicit commit, `X` can also go negative: `←` past 0 steps towards newer commits (along HEAD's first-parent chain) up to HEAD.
+In that direction `<commit>` is the old side and the newer commit is the new side.
+
 ## Keys
 
 | Key | Action |
