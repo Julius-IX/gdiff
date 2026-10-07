@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   io::{self, Write},
   process::{Command, Stdio},
   sync::mpsc::{self, Receiver, Sender},
@@ -452,22 +452,60 @@ impl Ctx {
 struct Job {
   offset: usize,
   width: u16,
+  urgent: bool, // the user is looking at this one (vs. speculative prefetch)
 }
 
 struct Reply {
   offset: usize,
   width: u16,
-  view: View,
+  view: Option<View>, // None = job was skipped/dropped
 }
 
-/// Single worker thread: if several requests pile up, only the newest one is built.
+/// Single worker thread. Rules:
+///  - newest urgent job wins, older urgent ones are dropped (key-repeat coalescing for free)
+///  - prefetch jobs run only when nothing urgent is waiting, and only near the cursor
 fn worker(ctx: Ctx, jobs: Receiver<Job>, replies: Sender<Reply>) {
-  while let Ok(mut job) = jobs.recv() {
-    while let Ok(newer) = jobs.try_recv() {
-      job = newer;
+  let mut queue: Vec<Job> = Vec::new();
+  let mut focus = 0usize;
+
+  loop {
+    if queue.is_empty() {
+      match jobs.recv() {
+        Ok(j) => queue.push(j),
+        Err(_) => return,
+      }
     }
+    while let Ok(j) = jobs.try_recv() {
+      queue.push(j);
+    }
+
+    let idx = queue.iter().rposition(|j| j.urgent).unwrap_or(0);
+    let job = queue.remove(idx);
+    if job.urgent {
+      focus = job.offset;
+    }
+
+    let (dead, live): (Vec<Job>, Vec<Job>) = queue.drain(..).partition(|j| {
+      (job.urgent && j.urgent) || (!j.urgent && j.offset.abs_diff(focus) > 2)
+    });
+    queue = live;
+    for j in dead {
+      let r = Reply { offset: j.offset, width: j.width, view: None };
+      if replies.send(r).is_err() {
+        return;
+      }
+    }
+
+    if !job.urgent && job.offset.abs_diff(focus) > 2 {
+      let r = Reply { offset: job.offset, width: job.width, view: None };
+      if replies.send(r).is_err() {
+        return;
+      }
+      continue;
+    }
+
     let view = ctx.build(job.offset, job.width);
-    let r = Reply { offset: job.offset, width: job.width, view };
+    let r = Reply { offset: job.offset, width: job.width, view: Some(view) };
     if replies.send(r).is_err() {
       return;
     }
@@ -484,6 +522,7 @@ struct App {
   view: View, // what's on screen right now
   loading: bool,
   cache: HashMap<usize, View>,
+  requested: HashSet<usize>, // jobs in flight to prevent duplicates
   jobs: Sender<Job>,
   replies: Receiver<Reply>,
   pending_scroll: Option<usize>, // restore scroll after a resize re-render
@@ -495,8 +534,21 @@ struct App {
 }
 
 impl App {
-  fn request(&mut self, offset: usize) {
-    let _ = self.jobs.send(Job { offset, width: self.width });
+  fn request(&mut self, offset: usize, urgent: bool) {
+    if self.cache.contains_key(&offset) || self.requested.contains(&offset) {
+      return;
+    }
+    self.requested.insert(offset);
+    let _ = self.jobs.send(Job { offset, width: self.width, urgent });
+  }
+
+  fn prefetch(&mut self) {
+    for d in [1isize, -1, 2, -2] {
+      let o = self.offset as isize + d;
+      if o >= 0 && o <= self.max_offset as isize {
+        self.request(o as usize, false);
+      }
+    }
   }
 
   /// Point the screen at `self.offset`: instant if cached, otherwise ask the worker.
@@ -506,10 +558,11 @@ impl App {
       self.view = v.clone();
       self.scroll = 0;
       self.loading = false;
+      self.prefetch();
     } else {
       self.loading = true;
       let o = self.offset;
-      self.request(o);
+      self.request(o, true);
     }
   }
 
@@ -534,17 +587,27 @@ impl App {
 
   /// Collect whatever the worker has finished.
   fn pump(&mut self) {
+    let mut changed = false;
     while let Ok(r) = self.replies.try_recv() {
       if r.width != self.width {
         continue; // rendered for an old terminal size
       }
-      if r.offset == self.offset {
-        self.view = r.view.clone();
-        self.scroll = self.pending_scroll.take().unwrap_or(0);
-        self.loading = false;
+      self.requested.remove(&r.offset);
+      if let Some(v) = r.view {
+        if r.offset == self.offset {
+          self.view = v.clone();
+          self.scroll = self.pending_scroll.take().unwrap_or(0);
+          self.loading = false;
+        }
+        self.cache.insert(r.offset, v);
+        changed = true;
       }
-      self.cache.insert(r.offset, r.view);
+    }
+    if changed {
       self.evict();
+      if !self.loading {
+        self.prefetch();
+      }
     }
   }
 
@@ -555,10 +618,11 @@ impl App {
     }
     self.width = cols.saturating_sub(2);
     self.cache.clear();
+    self.requested.clear();
     let scroll = self.scroll;
     self.loading = true;
     let o = self.offset;
-    self.request(o);
+    self.request(o, true);
     self.pending_scroll = Some(scroll);
   }
 
@@ -773,6 +837,7 @@ fn main() {
     view: View::default(),
     loading: false,
     cache: HashMap::new(),
+    requested: HashSet::new(),
     jobs: job_tx,
     replies: reply_rx,
     pending_scroll: None,
