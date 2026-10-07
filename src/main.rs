@@ -1,6 +1,7 @@
 use std::{
   io::{self, Write},
   process::{Command, Stdio},
+  thread,
 };
 
 use clap::Parser;
@@ -298,7 +299,7 @@ impl App {
     }
   }
 
-  /// Short hash + header (hash, author, date) + full message of `base~n` 
+  /// Short hash + header (hash, author, date) + full message of `base~n`
   fn commit_info(&self, n: usize) -> (String, Vec<Line<'static>>) {
     let dim = Style::new().fg(Color::DarkGray);
     let fmt = "--format=%h%x00%an%x00%ad%x00%B";
@@ -374,17 +375,30 @@ impl App {
       args.push(self.rev(n));
     }
     args.push("--".into());
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    let (old_hash, old_msg) = self.commit_info(old_n);
+    // diff and both commit lookups are independent, so run them side by side
+    let this = &*self;
+    let (diff, old_info, new_info) = thread::scope(|s| {
+      let d = s.spawn(|| git(&argv));
+      let o = s.spawn(|| this.commit_info(old_n));
+      let n = new_n.map(|n| s.spawn(move || this.commit_info(n)));
+      (
+        d.join().unwrap(),
+        o.join().unwrap(),
+        n.map(|h| h.join().unwrap()),
+      )
+    });
+
+    let (old_hash, old_msg) = old_info;
     self.old_label = format!("{old_hash} ({})", self.name(old_n));
     self.old_msg = old_msg;
-    match new_n {
-      Some(n) => {
-        let (hash, msg) = self.commit_info(n);
+    match (new_n, new_info) {
+      (Some(n), Some((hash, msg))) => {
         self.new_label = format!("{hash} ({})", self.name(n));
         self.new_msg = msg;
       }
-      None => {
+      _ => {
         self.new_label = "working tree".into();
         self.new_msg = vec![Line::styled(
           "Working tree: uncommitted changes",
@@ -401,9 +415,8 @@ impl App {
     let width = terminal::size()
       .map(|(c, _)| c.saturating_sub(2))
       .unwrap_or(80);
-    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    self.lines = match git(&argv) {
+    self.lines = match diff {
       Err(e) => err_lines(&e),
       Ok(d) if d.trim().is_empty() => {
         vec![Line::styled(
