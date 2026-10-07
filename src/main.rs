@@ -256,33 +256,36 @@ fn parse_ansi(text: &str) -> Vec<Line<'static>> {
   lines
 }
 
-struct App {
+fn term_width() -> u16 {
+  terminal::size()
+    .map(|(c, _)| c.saturating_sub(2))
+    .unwrap_or(80)
+}
+
+/// Everything needed to build a view for any offset. Cloneable so the worker thread owns a copy.
+#[derive(Clone)]
+struct Ctx {
   base: String,      // full hash of the starting commit
-  base_name: String, // what to call it in the UI ("HEAD" or whatever the user passed)
+  base_name: String, // what to call it in the UI
   working_tree: bool,
   follow: bool,
-  total: usize,
-  offset: usize,
-  max_offset: usize,
+  raw: bool,
+  pager: Option<String>,
+  color: bool,
+}
 
-  raw: bool,             // --no-pager: ignore user config entirely
-  pager: Option<String>, // resolved from git config (None when raw)
-  color: bool,           // does the user's color.diff want color?
-
+/// One fully-rendered screen's worth of data, for caching
+#[derive(Clone, Default)]
+struct View {
   lines: Vec<Line<'static>>,
   title: String,
   old_label: String,
   new_label: String,
-  scroll: usize,
-  page: usize,
-  exit: bool,
-
-  show_msg: bool, // commit message popup
   old_msg: Vec<Line<'static>>,
   new_msg: Vec<Line<'static>>,
 }
 
-impl App {
+impl Ctx {
   fn rev(&self, n: usize) -> String {
     if n == 0 {
       self.base.clone()
@@ -353,15 +356,16 @@ impl App {
     }
   }
 
-  /// Re-run git diff (and the pager) for the current offset.
-  fn refresh(&mut self) {
+  /// Build the whole view for `offset`. Pure function of (ctx, offset, width),
+  /// so it can run on any thread. git diff + both git logs run in parallel.
+  fn build(&self, offset: usize, width: u16) -> View {
     // old = the side that moves back in time, new = the static side
     let (old_n, new_n) = if self.follow {
-      (self.offset + 1, Some(self.offset))
+      (offset + 1, Some(offset))
     } else if self.working_tree {
-      (self.offset, None)
+      (offset, None)
     } else {
-      (self.offset, Some(0))
+      (offset, Some(0))
     };
 
     let mut args: Vec<String> = vec!["diff".into()];
@@ -377,12 +381,10 @@ impl App {
     args.push("--".into());
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 
-    // diff and both commit lookups are independent, so run them side by side
-    let this = &*self;
     let (diff, old_info, new_info) = thread::scope(|s| {
       let d = s.spawn(|| git(&argv));
-      let o = s.spawn(|| this.commit_info(old_n));
-      let n = new_n.map(|n| s.spawn(move || this.commit_info(n)));
+      let o = s.spawn(|| self.commit_info(old_n));
+      let n = new_n.map(|n| s.spawn(move || self.commit_info(n)));
       (
         d.join().unwrap(),
         o.join().unwrap(),
@@ -391,32 +393,25 @@ impl App {
     });
 
     let (old_hash, old_msg) = old_info;
-    self.old_label = format!("{old_hash} ({})", self.name(old_n));
-    self.old_msg = old_msg;
-    match (new_n, new_info) {
-      (Some(n), Some((hash, msg))) => {
-        self.new_label = format!("{hash} ({})", self.name(n));
-        self.new_msg = msg;
-      }
-      _ => {
-        self.new_label = "working tree".into();
-        self.new_msg = vec![Line::styled(
+    let old_label = format!("{old_hash} ({})", self.name(old_n));
+    let (new_label, new_msg) = match (new_n, new_info) {
+      (Some(n), Some((h, m))) => (format!("{h} ({})", self.name(n)), m),
+      _ => (
+        "working tree".to_string(),
+        vec![Line::styled(
           "Working tree: uncommitted changes",
           Style::new().fg(Color::DarkGray),
-        )];
-      }
-    }
-    self.title = format!(
+        )],
+      ),
+    };
+    let title = format!(
       " git diff {}{} ",
       self.name(old_n),
       new_n.map_or(String::new(), |n| format!(" {}", self.name(n)))
     );
 
-    let width = terminal::size()
-      .map(|(c, _)| c.saturating_sub(2))
-      .unwrap_or(80);
-
-    self.lines = match diff {
+    // slow ass pagers
+    let lines = match diff {
       Err(e) => err_lines(&e),
       Ok(d) if d.trim().is_empty() => {
         vec![Line::styled(
@@ -436,6 +431,35 @@ impl App {
         }
       }
     };
+
+    View {
+      lines,
+      title,
+      old_label,
+      new_label,
+      old_msg,
+      new_msg,
+    }
+  }
+}
+
+struct App {
+  ctx: Ctx,
+  total: usize,
+  offset: usize,
+  max_offset: usize,
+
+  view: View, // what's on screen right now
+  scroll: usize,
+  page: usize,
+  exit: bool,
+  show_msg: bool, // commit message popup
+}
+
+impl App {
+  /// Rebuild the view for the current offset.
+  fn refresh(&mut self) {
+    self.view = self.ctx.build(self.offset, term_width());
     self.scroll = 0;
   }
 
@@ -458,27 +482,29 @@ impl App {
     // Diff pane: only hand ratatui the lines that are actually visible
     let block = Block::default()
       .borders(Borders::ALL)
-      .title(self.title.clone());
+      .title(self.view.title.clone());
     let inner_h = block.inner(main).height as usize;
     self.page = inner_h.max(1);
-    self.scroll = self.scroll.min(self.lines.len().saturating_sub(inner_h));
-    let end = (self.scroll + inner_h).min(self.lines.len());
-    let visible = self.lines[self.scroll..end].to_vec();
+    self.scroll = self
+      .scroll
+      .min(self.view.lines.len().saturating_sub(inner_h));
+    let end = (self.scroll + inner_h).min(self.view.lines.len());
+    let visible = self.view.lines[self.scroll..end].to_vec();
     f.render_widget(Paragraph::new(visible).block(block), main);
 
     // Indicator line
     let bold = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
     let indicator = Line::from(vec![
       Span::raw(" new: "),
-      Span::styled(self.new_label.clone(), bold(Color::Green)),
+      Span::styled(self.view.new_label.clone(), bold(Color::Green)),
       Span::raw("   old: "),
-      Span::styled(self.old_label.clone(), bold(Color::Red)),
+      Span::styled(self.view.old_label.clone(), bold(Color::Red)),
       Span::raw(format!(
         "   │ step {}/{} · {} commits · via {}",
         self.offset,
         self.max_offset,
         self.total,
-        self.mode_label()
+        self.ctx.mode_label()
       )),
     ]);
     f.render_widget(Paragraph::new(indicator), info);
@@ -507,14 +533,18 @@ impl App {
           .wrap(Wrap { trim: false })
       };
       f.render_widget(
-        pane(format!(" old: {} ", self.old_label), Color::Red, &self.old_msg),
+        pane(
+          format!(" old: {} ", self.view.old_label),
+          Color::Red,
+          &self.view.old_msg,
+        ),
         top,
       );
       f.render_widget(
         pane(
-          format!(" new: {} (m to close) ", self.new_label),
+          format!(" new: {} (m to close) ", self.view.new_label),
           Color::Green,
-          &self.new_msg,
+          &self.view.new_msg,
         ),
         bottom,
       );
@@ -527,7 +557,7 @@ impl App {
       terminal.draw(|f| self.draw(f))?;
       match event::read()? {
         // pager output is width-dependent (delta etc.), so re-render on resize
-        Event::Resize(..) if self.pager.is_some() => {
+        Event::Resize(..) if self.ctx.pager.is_some() => {
           let s = self.scroll;
           self.refresh();
           self.scroll = s;
@@ -610,28 +640,27 @@ fn main() {
     total.saturating_sub(1)
   };
 
-  let mut app = App {
+  let ctx = Ctx {
     base,
     base_name,
     working_tree: args.commit.is_none() && !args.follow,
     follow: args.follow,
-    total,
-    offset: 0,
-    max_offset,
     raw: args.no_pager,
     pager: if args.no_pager { None } else { find_pager() },
     // exit code 0 = "yes, color" (we pretend stdout is a tty, since the TUI is one)
     color: git(&["config", "--get-colorbool", "color.diff", "true"]).is_ok(),
-    lines: vec![],
-    title: String::new(),
-    old_label: String::new(),
-    new_label: String::new(),
+  };
+
+  let mut app = App {
+    ctx,
+    total,
+    offset: 0,
+    max_offset,
+    view: View::default(),
     scroll: 0,
     page: 10,
     exit: false,
     show_msg: false,
-    old_msg: vec![],
-    new_msg: vec![],
   };
 
   let mut terminal = ratatui::init();
