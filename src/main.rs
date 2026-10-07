@@ -5,7 +5,10 @@ use std::{
 
 use clap::Parser;
 use ratatui::{
-  crossterm::terminal,
+  crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal,
+  },
   layout::{Constraint, Layout},
   style::{Color, Modifier, Style},
   text::{Line, Span},
@@ -426,7 +429,31 @@ impl App {
   }
 
   fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
-    todo!()
+    self.refresh();
+    while !self.exit {
+      terminal.draw(|f| self.draw(f))?;
+      match event::read()? {
+        // pager output is width-dependent (delta etc.), so re-render on resize
+        Event::Resize(..) if self.pager.is_some() => {
+          let s = self.scroll;
+          self.refresh();
+          self.scroll = s;
+        }
+        Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
+          KeyCode::Char('q') | KeyCode::Esc => self.exit = true,
+          KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.exit = true,
+          KeyCode::Right => self.step(1),
+          KeyCode::Left => self.step(-1),
+          KeyCode::Down => self.scroll += 1,
+          KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+          KeyCode::PageDown => self.scroll += self.page,
+          KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page),
+          _ => {}
+        },
+        _ => {}
+      }
+    }
+    Ok(())
   }
 }
 
