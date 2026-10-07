@@ -485,19 +485,27 @@ fn worker(ctx: Ctx, jobs: Receiver<Job>, replies: Sender<Reply>) {
       focus = job.offset;
     }
 
-    let (dead, live): (Vec<Job>, Vec<Job>) = queue.drain(..).partition(|j| {
-      (job.urgent && j.urgent) || (!j.urgent && j.offset.abs_diff(focus) > 2)
-    });
+    let (dead, live): (Vec<Job>, Vec<Job>) = queue
+      .drain(..)
+      .partition(|j| (job.urgent && j.urgent) || (!j.urgent && j.offset.abs_diff(focus) > 2));
     queue = live;
     for j in dead {
-      let r = Reply { offset: j.offset, width: j.width, view: None };
+      let r = Reply {
+        offset: j.offset,
+        width: j.width,
+        view: None,
+      };
       if replies.send(r).is_err() {
         return;
       }
     }
 
     if !job.urgent && job.offset.abs_diff(focus) > 2 {
-      let r = Reply { offset: job.offset, width: job.width, view: None };
+      let r = Reply {
+        offset: job.offset,
+        width: job.width,
+        view: None,
+      };
       if replies.send(r).is_err() {
         return;
       }
@@ -505,7 +513,11 @@ fn worker(ctx: Ctx, jobs: Receiver<Job>, replies: Sender<Reply>) {
     }
 
     let view = ctx.build(job.offset, job.width);
-    let r = Reply { offset: job.offset, width: job.width, view: Some(view) };
+    let r = Reply {
+      offset: job.offset,
+      width: job.width,
+      view: Some(view),
+    };
     if replies.send(r).is_err() {
       return;
     }
@@ -539,7 +551,11 @@ impl App {
       return;
     }
     self.requested.insert(offset);
-    let _ = self.jobs.send(Job { offset, width: self.width, urgent });
+    let _ = self.jobs.send(Job {
+      offset,
+      width: self.width,
+      urgent,
+    });
   }
 
   fn prefetch(&mut self) {
@@ -608,6 +624,12 @@ impl App {
       if !self.loading {
         self.prefetch();
       }
+    }
+    // the job for the visible commit may have been dropped by the worker
+    // (superseded, or prefetch that fell out of range): ask again
+    if self.loading && !self.requested.contains(&self.offset) {
+      let o = self.offset;
+      self.request(o, true);
     }
   }
 
