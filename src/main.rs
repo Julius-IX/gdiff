@@ -5,8 +5,10 @@ use std::{
 
 use clap::Parser;
 use ratatui::{
+  layout::{Constraint, Layout},
   style::{Color, Modifier, Style},
   text::{Line, Span},
+  widgets::{Block, Borders, Paragraph},
   DefaultTerminal, Frame,
 };
 
@@ -325,7 +327,47 @@ impl App {
   }
 
   fn draw(&mut self, f: &mut Frame) {
-    todo!()
+    let [main, info, keys] = Layout::vertical([
+      Constraint::Min(1),
+      Constraint::Length(1),
+      Constraint::Length(1),
+    ])
+    .areas(f.area());
+
+    // Diff pane: only hand ratatui the lines that are actually visible
+    let block = Block::default()
+      .borders(Borders::ALL)
+      .title(self.title.clone());
+    let inner_h = block.inner(main).height as usize;
+    self.page = inner_h.max(1);
+    self.scroll = self.scroll.min(self.lines.len().saturating_sub(inner_h));
+    let end = (self.scroll + inner_h).min(self.lines.len());
+    let visible = self.lines[self.scroll..end].to_vec();
+    f.render_widget(Paragraph::new(visible).block(block), main);
+
+    // Indicator line
+    let bold = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
+    let indicator = Line::from(vec![
+      Span::raw("   new: "),
+      Span::styled(self.new_label.clone(), bold(Color::Green)),
+      Span::raw(" old: "),
+      Span::styled(self.old_label.clone(), bold(Color::Red)),
+      Span::raw(format!(
+        "   │ step {}/{} · {} commits · via {}",
+        self.offset,
+        self.max_offset,
+        self.total,
+        self.mode_label()
+      )),
+    ]);
+    f.render_widget(Paragraph::new(indicator), info);
+
+    // Controls bar
+    let bar = Paragraph::new(
+      " q quit │ ↑/↓ scroll diff │ PgUp/PgDn page │ ←/→ older/newer commit to compare against ",
+    )
+    .style(Style::new().add_modifier(Modifier::REVERSED));
+    f.render_widget(bar, keys);
   }
 
   fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
