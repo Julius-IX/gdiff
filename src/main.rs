@@ -457,4 +457,71 @@ impl App {
   }
 }
 
-fn main() {}
+fn die(msg: &str) -> ! {
+  eprintln!("error: {msg}");
+  std::process::exit(1);
+}
+
+fn main() {
+  let args = Args::parse();
+
+  match git(&["rev-parse", "--is-inside-work-tree"]) {
+    Ok(s) if s.trim() == "true" => {}
+    _ => die("not inside a git repository"),
+  }
+
+  let base_name = args.commit.clone().unwrap_or_else(|| "HEAD".into());
+  let base = git(&[
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    &format!("{base_name}^{{commit}}"),
+  ])
+  .map(|s| s.trim().to_string())
+  .unwrap_or_else(|_| {
+    die(&format!(
+      "can't resolve '{base_name}' to a commit (any commits yet?)"
+    ))
+  });
+
+  let total: usize = git(&["rev-list", "--count", &base])
+    .ok()
+    .and_then(|s| s.trim().parse().ok())
+    .unwrap_or(1);
+
+  // Non-follow: base~X needs X <= total-1. Follow: also needs base~(X+1), so one less.
+  let max_offset = if args.follow {
+    total.saturating_sub(2)
+  } else {
+    total.saturating_sub(1)
+  };
+
+  let mut app = App {
+    base,
+    base_name,
+    working_tree: args.commit.is_none() && !args.follow,
+    follow: args.follow,
+    total,
+    offset: 0,
+    max_offset,
+    raw: args.no_pager,
+    pager: if args.no_pager { None } else { find_pager() },
+    // exit code 0 = "yes, color" (we pretend stdout is a tty, since the TUI is one)
+    color: git(&["config", "--get-colorbool", "color.diff", "true"]).is_ok(),
+    lines: vec![],
+    title: String::new(),
+    old_label: String::new(),
+    new_label: String::new(),
+    scroll: 0,
+    page: 10,
+    exit: false,
+  };
+
+  let mut terminal = ratatui::init();
+  let result = app.run(&mut terminal);
+  ratatui::restore();
+
+  if let Err(e) = result {
+    die(&e.to_string());
+  }
+}
