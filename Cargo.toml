@@ -1,0 +1,8 @@
+[package]
+name = "gdiff"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.29"
