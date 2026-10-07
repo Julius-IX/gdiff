@@ -664,10 +664,10 @@ impl App {
         KeyCode::Esc => self.exit = true,
         KeyCode::Char('m') => self.show_msg = !self.show_msg,
         KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.exit = true,
-        KeyCode::Right => self.step(1),
-        KeyCode::Left => self.step(-1),
-        KeyCode::Down => self.scroll += 1,
-        KeyCode::Up => self.scroll = self.scroll.saturating_sub(1),
+        KeyCode::Right | KeyCode::Char('l') => self.step(1),
+        KeyCode::Left | KeyCode::Char('h') => self.step(-1),
+        KeyCode::Down | KeyCode::Char('j') => self.scroll += 1,
+        KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
         KeyCode::PageDown => self.scroll += self.page,
         KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page),
         _ => {}
@@ -723,7 +723,7 @@ impl App {
 
     // Controls bar
     let bar = Paragraph::new(
-      " q quit │ ↑/↓ scroll │ PgUp/PgDn page │ ←/→ newer/older commit │ m messages ",
+      " q quit │ ↑/↓ j/k scroll │ PgUp/PgDn page │ ←/→ h/l newer/older commit │ m messages ",
     )
     .style(Style::new().add_modifier(Modifier::REVERSED));
     f.render_widget(bar, keys);

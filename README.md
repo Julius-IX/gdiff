@@ -29,8 +29,8 @@ In that direction `<commit>` is the old side and the newer commit is the new sid
 
 | Key | Action |
 | --- | --- |
-| `←` / `→` | Compare against a newer / older commit |
-| `↑` / `↓` | Scroll the diff |
+| `←` / `→` or `h` / `l` | Compare against a newer / older commit |
+| `↑` / `↓` or `j` / `k` | Scroll the diff |
 | `PgUp` / `PgDn` | Scroll a page |
 | `q` / `Esc` | Quit |
 
