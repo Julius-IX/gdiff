@@ -406,9 +406,10 @@ impl App {
     // Indicator line
     let bold = |c| Style::new().fg(c).add_modifier(Modifier::BOLD);
     let indicator = Line::from(vec![
-      Span::raw("   new: "),
+      Span::raw(" new: "),
       Span::styled(self.new_label.clone(), bold(Color::Green)),
-      Span::raw(" old: "),
+      Span::raw("   old: "),
+      Span::styled(self.old_label.clone(), bold(Color::Red)),
       Span::styled(self.old_label.clone(), bold(Color::Red)),
       Span::raw(format!(
         "   │ step {}/{} · {} commits · via {}",
