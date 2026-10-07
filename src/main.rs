@@ -1,5 +1,5 @@
 use std::{
-  io::Write,
+  io::{self, Write},
   process::{Command, Stdio},
 };
 
@@ -7,6 +7,7 @@ use clap::Parser;
 use ratatui::{
   style::{Color, Modifier, Style},
   text::{Line, Span},
+  DefaultTerminal, Frame,
 };
 
 #[derive(Parser)]
@@ -246,6 +247,90 @@ fn parse_ansi(text: &str) -> Vec<Line<'static>> {
     lines.push(line);
   }
   lines
+}
+
+struct App {
+  base: String,      // full hash of the starting commit
+  base_name: String, // what to call it in the UI ("HEAD" or whatever the user passed)
+  working_tree: bool,
+  follow: bool,
+  total: usize,
+  offset: usize,
+  max_offset: usize,
+
+  raw: bool,             // --no-pager: ignore user config entirely
+  pager: Option<String>, // resolved from git config (None when raw)
+  color: bool,           // does the user's color.diff want color?
+
+  lines: Vec<Line<'static>>,
+  title: String,
+  old_label: String,
+  new_label: String,
+  scroll: usize,
+  page: usize,
+  exit: bool,
+}
+
+impl App {
+  fn rev(&self, n: usize) -> String {
+    if n == 0 {
+      self.base.clone()
+    } else {
+      format!("{}~{}", self.base, n)
+    }
+  }
+
+  fn name(&self, n: usize) -> String {
+    if n == 0 {
+      self.base_name.clone()
+    } else {
+      format!("{}~{}", self.base_name, n)
+    }
+  }
+
+  fn side(&self, n: usize) -> String {
+    let short = git(&["rev-parse", "--short", &self.rev(n)])
+      .map(|s| s.trim().to_string())
+      .unwrap_or_else(|_| "???".into());
+    format!("{short} ({})", self.name(n))
+  }
+
+  fn mode_label(&self) -> String {
+    if self.raw {
+      "built-in colors".into()
+    } else if let Some(p) = &self.pager {
+      p.split_whitespace()
+        .next()
+        .unwrap_or("pager")
+        .rsplit('/')
+        .next()
+        .unwrap_or("pager")
+        .to_string()
+    } else {
+      "git colors".into()
+    }
+  }
+
+  /// Re-run git diff (and the pager) for the current offset.
+  fn refresh(&mut self) {
+    todo!()
+  }
+
+  fn step(&mut self, delta: isize) {
+    let new = (self.offset as isize + delta).clamp(0, self.max_offset as isize) as usize;
+    if new != self.offset {
+      self.offset = new;
+      self.refresh();
+    }
+  }
+
+  fn draw(&mut self, f: &mut Frame) {
+    todo!()
+  }
+
+  fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    todo!()
+  }
 }
 
 fn main() {}
