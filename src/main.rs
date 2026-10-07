@@ -1,4 +1,5 @@
 use std::{
+  collections::HashMap,
   io::{self, Write},
   process::{Command, Stdio},
   thread,
@@ -31,6 +32,9 @@ struct Args {
   #[arg(long)]
   no_pager: bool,
 }
+
+/// How many entries to keep around before evicting the ones farthest from the cursor.
+const CACHE_MAX: usize = 24;
 
 /// Run git, return stdout on success or stderr on failure.
 fn git(args: &[&str]) -> Result<String, String> {
@@ -450,6 +454,7 @@ struct App {
   max_offset: usize,
 
   view: View, // what's on screen right now
+  cache: HashMap<usize, View>,
   scroll: usize,
   page: usize,
   exit: bool,
@@ -457,10 +462,27 @@ struct App {
 }
 
 impl App {
-  /// Rebuild the view for the current offset.
   fn refresh(&mut self) {
-    self.view = self.ctx.build(self.offset, term_width());
+    if let Some(v) = self.cache.get(&self.offset) {
+      self.view = v.clone();
+    } else {
+      let v = self.ctx.build(self.offset, term_width());
+      self.cache.insert(self.offset, v.clone());
+      self.evict();
+      self.view = v;
+    }
     self.scroll = 0;
+  }
+
+  fn evict(&mut self) {
+    while self.cache.len() > CACHE_MAX {
+      let cur = self.offset;
+      let far = self.cache.keys().copied().max_by_key(|k| k.abs_diff(cur));
+      match far {
+        Some(k) => self.cache.remove(&k),
+        None => break,
+      };
+    }
   }
 
   fn step(&mut self, delta: isize) {
@@ -559,6 +581,7 @@ impl App {
         // pager output is width-dependent (delta etc.), so re-render on resize
         Event::Resize(..) if self.ctx.pager.is_some() => {
           let s = self.scroll;
+          self.cache.clear(); // pager output depends on terminal width
           self.refresh();
           self.scroll = s;
         }
@@ -657,6 +680,7 @@ fn main() {
     offset: 0,
     max_offset,
     view: View::default(),
+    cache: HashMap::new(),
     scroll: 0,
     page: 10,
     exit: false,
