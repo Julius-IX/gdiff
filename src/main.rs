@@ -5,6 +5,7 @@ use std::{
 
 use clap::Parser;
 use ratatui::{
+  crossterm::terminal,
   layout::{Constraint, Layout},
   style::{Color, Modifier, Style},
   text::{Line, Span},
@@ -315,7 +316,61 @@ impl App {
 
   /// Re-run git diff (and the pager) for the current offset.
   fn refresh(&mut self) {
-    todo!()
+    // old = the side that moves back in time, new = the static side
+    let (old_n, new_n) = if self.follow {
+      (self.offset + 1, Some(self.offset))
+    } else if self.working_tree {
+      (self.offset, None)
+    } else {
+      (self.offset, Some(0))
+    };
+
+    let mut args: Vec<String> = vec!["diff".into()];
+    if self.raw {
+      args.extend(["--no-color".into(), "--no-ext-diff".into()]);
+    } else if self.color {
+      args.push("--color=always".into());
+    }
+    args.push(self.rev(old_n));
+    if let Some(n) = new_n {
+      args.push(self.rev(n));
+    }
+    args.push("--".into());
+
+    self.old_label = self.side(old_n);
+    self.new_label = new_n.map_or("working tree".into(), |n| self.side(n));
+    self.title = format!(
+      " git diff {}{} ",
+      self.name(old_n),
+      new_n.map_or(String::new(), |n| format!(" {}", self.name(n)))
+    );
+
+    let width = terminal::size()
+      .map(|(c, _)| c.saturating_sub(2))
+      .unwrap_or(80);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    self.lines = match git(&argv) {
+      Err(e) => err_lines(&e),
+      Ok(d) if d.trim().is_empty() => {
+        vec![Line::styled(
+          "(no changes)",
+          Style::new().fg(Color::DarkGray),
+        )]
+      }
+      Ok(d) if self.raw => d.lines().map(style_line).collect(),
+      Ok(d) => {
+        let text = match &self.pager {
+          Some(p) => through_pager(p, &d, width),
+          None => Ok(d),
+        };
+        match text {
+          Ok(t) => parse_ansi(&t),
+          Err(e) => err_lines(&format!("pager failed: {e}\n(try --no-pager)")),
+        }
+      }
+    };
+    self.scroll = 0;
   }
 
   fn step(&mut self, delta: isize) {
